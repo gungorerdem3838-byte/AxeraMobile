@@ -1,0 +1,477 @@
+name: Build Axera Mobile Launcher
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate Project Structure & Code
+        run: |
+          mkdir -p app/src/main/java/com/axera/launcher
+          mkdir -p app/src/main/res/values
+
+          # 1. settings.gradle
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AxeraMobile"
+          include ':app'
+          EOF
+
+          # 2. Root build.gradle
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.20' apply false
+          }
+          EOF
+
+          # 3. gradle.properties
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          EOF
+
+          # 4. app/build.gradle (Sifir ekstra kutuphane, maksimum performans)
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.axera.launcher'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.axera.launcher"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0-Axera"
+                  ndk {
+                      abiFilters 'arm64-v8a'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                  }
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              // Sifir harici bagimlilik! Saf Android SDK ve Kotlin.
+          }
+          EOF
+
+          # 5. AndroidManifest.xml
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.axera.launcher">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <application
+                  android:label="Axera Launcher"
+                  android:largeHeap="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # 6. CoreMotor.kt (JSON Parser, İndirme ve JRE Başlatma Motoru)
+          cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
+          package com.axera.launcher
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class CoreMotor(private val context: Context, private val logger: (String) -> Unit) {
+
+              val mcDir = File(context.filesDir, ".minecraft")
+              val versionsDir = File(mcDir, "versions")
+              val librariesDir = File(mcDir, "libraries")
+              val assetsDir = File(mcDir, "assets")
+              val nativesDir = File(mcDir, "natives")
+              val jreDir = File(context.filesDir, "runtime/jre")
+
+              init {
+                  listOf(mcDir, versionsDir, librariesDir, assetsDir, nativesDir, jreDir).forEach {
+                      if (!it.exists()) it.mkdirs()
+                  }
+              }
+
+              // Mojang API'den sürüm verisini ve kütüphaneleri indirir
+              fun prepareVersion(versionId: String): Boolean {
+                  return try {
+                      logger("Mojang sunucularına bağlanılıyor ($versionId)...")
+                      val manifestJson = fetchString("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+                      val versions = JSONObject(manifestJson).getJSONArray("versions")
+                      
+                      var versionUrl: String? = null
+                      for (i in 0 until versions.length()) {
+                          val v = versions.getJSONObject(i)
+                          if (v.getString("id") == versionId) {
+                              versionUrl = v.getString("url")
+                              break
+                          }
+                      }
+
+                      if (versionUrl == null) {
+                          logger("HATA: Sürüm bulunamadı!")
+                          return false
+                      }
+
+                      val vDir = File(versionsDir, versionId).apply { mkdirs() }
+                      val vJsonFile = File(vDir, "$versionId.json")
+                      val vJsonStr = fetchString(versionUrl)
+                      vJsonFile.writeText(vJsonStr)
+
+                      val vObj = JSONObject(vJsonStr)
+                      
+                      // Client.jar indir
+                      val clientUrl = vObj.getJSONObject("downloads").getJSONObject("client").getString("url")
+                      val clientJar = File(vDir, "$versionId.jar")
+                      if (!clientJar.exists()) {
+                          logger("$versionId.jar indiriliyor...")
+                          downloadFile(clientUrl, clientJar)
+                      }
+
+                      // Kütüphaneleri indir
+                      val libs = vObj.getJSONArray("libraries")
+                      var downloadedCount = 0
+                      for (i in 0 until libs.length()) {
+                          val lib = libs.getJSONObject(i)
+                          if (!isLibAllowed(lib)) continue
+
+                          val downloads = lib.optJSONObject("downloads") ?: continue
+                          val artifact = downloads.optJSONObject("artifact") ?: continue
+                          val path = artifact.getString("path")
+                          val url = artifact.getString("url")
+                          
+                          val libFile = File(librariesDir, path)
+                          if (!libFile.exists()) {
+                              libFile.parentFile?.mkdirs()
+                              logger("Kütüphane: ${libFile.name}")
+                              downloadFile(url, libFile)
+                              downloadedCount++
+                          }
+                      }
+                      logger("Kurulum tamam! ($downloadedCount yeni dosya indirildi)")
+                      true
+                  } catch (e: Exception) {
+                      logger("İndirme Hatası: ${e.message}")
+                      false
+                  }
+              }
+
+              private fun isLibAllowed(lib: JSONObject): Boolean {
+                  val rules = lib.optJSONArray("rules") ?: return true
+                  var allow = false
+                  for (i in 0 until rules.length()) {
+                      val rule = rules.getJSONObject(i)
+                      val action = rule.getString("action") == "allow"
+                      val os = rule.optJSONObject("os")
+                      if (os == null || os.optString("name") == "linux") {
+                          allow = action
+                      }
+                  }
+                  return allow
+              }
+
+              // Classpath dizilimini oluşturur
+              private fun buildClasspath(versionId: String, vObj: JSONObject): String {
+                  val cp = StringBuilder()
+                  val libs = vObj.getJSONArray("libraries")
+                  for (i in 0 until libs.length()) {
+                      val lib = libs.getJSONObject(i)
+                      if (!isLibAllowed(lib)) continue
+                      val artifact = lib.optJSONObject("downloads")?.optJSONObject("artifact") ?: continue
+                      val libFile = File(librariesDir, artifact.getString("path"))
+                      if (libFile.exists()) {
+                          cp.append(libFile.absolutePath).append(":")
+                      }
+                  }
+                  val clientJar = File(File(versionsDir, versionId), "$versionId.jar")
+                  cp.append(clientJar.absolutePath)
+                  return cp.toString()
+              }
+
+              // Oyunu JRE ve GL4ES ile tetikler
+              fun launchGame(username: String, versionId: String, maxRamMb: Int) {
+                  try {
+                      val vJsonFile = File(File(versionsDir, versionId), "$versionId.json")
+                      if (!vJsonFile.exists()) {
+                          logger("Önce sürümü indirmelisin!")
+                          return
+                      }
+
+                      val vObj = JSONObject(vJsonFile.readText())
+                      val mainClass = vObj.getString("mainClass")
+                      val assetIndex = vObj.optString("assets", "legacy")
+                      val classpath = buildClasspath(versionId, vObj)
+
+                      val javaBin = File(jreDir, "bin/java")
+                      if (!javaBin.exists()) {
+                          logger("UYARI: ARM64 JRE bulunamadı (${javaBin.absolutePath}).")
+                          logger("Classpath hazırlandı (${classpath.split(":").size} kütüphane).")
+                          logger("Oyun başlatma komutu simüle ediliyor...")
+                      } else {
+                          javaBin.setExecutable(true)
+                      }
+
+                      val cmd = mutableListOf(
+                          javaBin.absolutePath,
+                          "-Xms512M",
+                          "-Xmx${maxRamMb}M",
+                          "-XX:+UseG1GC",
+                          "-XX:+ParallelRefProcEnabled",
+                          "-XX:MaxGCPauseMillis=200",
+                          "-Djava.library.path=${nativesDir.absolutePath}",
+                          "-Dorg.lwjgl.opengl.libname=libgl4es_114.so",
+                          "-cp", classpath,
+                          mainClass,
+                          "--username", username,
+                          "--version", versionId,
+                          "--gameDir", mcDir.absolutePath,
+                          "--assetsDir", assetsDir.absolutePath,
+                          "--assetIndex", assetIndex,
+                          "--uuid", "00000000-0000-0000-0000-000000000000",
+                          "--accessToken", "0",
+                          "--userType", "legacy"
+                      )
+
+                      logger("Başlatılıyor: $mainClass (RAM: ${maxRamMb}MB)")
+                      if (!javaBin.exists()) return
+
+                      val pb = ProcessBuilder(cmd)
+                      pb.directory(mcDir)
+                      
+                      // Mali-T830 (OpenGL ES) ve ARM64 için ortam değişkenleri
+                      val env = pb.environment()
+                      env["HOME"] = mcDir.absolutePath
+                      env["JAVA_HOME"] = jreDir.absolutePath
+                      env["LD_LIBRARY_PATH"] = "${nativesDir.absolutePath}:${jreDir.absolutePath}/lib:${jreDir.absolutePath}/lib/jli"
+                      env["LIBGL_ES"] = "2"
+                      env["LIBGL_MIPMAP"] = "3"
+                      env["LIBGL_NORMALIZE"] = "1"
+
+                      pb.redirectErrorStream(true)
+                      val process = pb.start()
+
+                      process.inputStream.bufferedReader().useLines { lines ->
+                          lines.forEach { logger("[JVM] $it") }
+                      }
+                  } catch (e: Exception) {
+                      logger("Çökme / Hata: ${e.message}")
+                  }
+              }
+
+              private fun fetchString(urlStr: String): String {
+                  val conn = URL(urlStr).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 10000
+                  return conn.inputStream.bufferedReader().readText()
+              }
+
+              private fun downloadFile(urlStr: String, dest: File) {
+                  val conn = URL(urlStr).openConnection() as HttpURLConnection
+                  conn.inputStream.use { input ->
+                      FileOutputStream(dest).use { output ->
+                          input.copyTo(output)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # 7. MainActivity.kt (Karanlık Tema, Sıfır XML, Saf Kod UI)
+          cat << 'EOF' > app/src/main/java/com/axera/launcher/MainActivity.kt
+          package com.axera.launcher
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.text.method.ScrollingMovementMethod
+          import android.view.Gravity
+          import android.widget.*
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private lateinit var logView: TextView
+              private lateinit var motor: CoreMotor
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  motor = CoreMotor(this) { msg ->
+                      runOnUiThread {
+                          logView.append("$msg\n")
+                      }
+                  }
+
+                  // Ana Tasarım (Yatay Ekran - Sol Panel Ayarlar, Sağ Panel Log/Konsol)
+                  val rootLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(Color.parseColor("#121212"))
+                      setPadding(32, 32, 32, 32)
+                  }
+
+                  // Sol Kontrol Paneli
+                  val leftPanel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f).apply {
+                          rightMargin = 24
+                      }
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "AXERA MOBILE"
+                      textSize = 24f
+                      setTextColor(Color.parseColor("#00E676"))
+                  }
+
+                  val userEdit = EditText(this).apply {
+                      hint = "Kullanıcı Adı"
+                      setText("Erdem")
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.GRAY)
+                  }
+
+                  val versionSpinner = Spinner(this).apply {
+                      // İlk test ve düşük RAM optimizasyonu için hafif sürümler + modern sürümler
+                      val versions = arrayOf("1.8.9", "1.12.2", "1.16.5", "1.20.4", "1.21.11")
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, versions)
+                  }
+
+                  val ramLabel = TextView(this).apply {
+                      text = "Verilecek RAM: 1150 MB (3GB Cihaz Optimize)"
+                      setTextColor(Color.LTGRAY)
+                  }
+
+                  val btnDownload = Button(this).apply {
+                      text = "1. Sürümü ve Kütüphaneleri İndir"
+                      setBackgroundColor(Color.parseColor("#1E88E5"))
+                      setTextColor(Color.WHITE)
+                  }
+
+                  val btnLaunch = Button(this).apply {
+                      text = "2. OYUNU BAŞLAT (TEK OYUNCULU)"
+                      setBackgroundColor(Color.parseColor("#00C853"))
+                      setTextColor(Color.WHITE)
+                  }
+
+                  leftPanel.apply {
+                      addView(title)
+                      addView(userEdit)
+                      addView(versionSpinner)
+                      addView(ramLabel)
+                      addView(btnDownload)
+                      addView(btnLaunch)
+                  }
+
+                  // Sağ Konsol Paneli
+                  logView = TextView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.5f)
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                      setTextColor(Color.parseColor("#00FF00"))
+                      textSize = 12f
+                      setPadding(16, 16, 16, 16)
+                      gravity = Gravity.BOTTOM
+                      movementMethod = ScrollingMovementMethod()
+                      text = "[Axera Motoru Hazır]\nHedef: ARM64 + GL4ES (OpenGL ES 2.0/3.0)\n"
+                  }
+
+                  rootLayout.addView(leftPanel)
+                  rootLayout.addView(logView)
+                  setContentView(rootLayout)
+
+                  // Buton Aksiyonları
+                  btnDownload.setOnClickListener {
+                      val ver = versionSpinner.selectedItem.toString()
+                      btnDownload.isEnabled = false
+                      thread {
+                          motor.prepareVersion(ver)
+                          runOnUiThread { btnDownload.isEnabled = true }
+                      }
+                  }
+
+                  btnLaunch.setOnClickListener {
+                      val user = userEdit.text.toString().ifBlank { "Erdem" }
+                      val ver = versionSpinner.selectedItem.toString()
+                      thread {
+                          motor.launchGame(user, ver, 1150)
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: |
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AxeraMobileLauncher-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
