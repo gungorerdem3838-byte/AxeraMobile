@@ -120,8 +120,8 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 6
-                  versionName "1.5-Axera"
+                  versionCode 7
+                  versionName "1.6-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
                   }
@@ -178,7 +178,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt (Pthread / C Kütüphane Köprüsü Eklendi)
+          # 6. CoreMotor.kt (Tüm glibc Köprüleri Eklendi)
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
@@ -223,13 +223,23 @@ jobs:
                   val jliDir = File(aarch64Dir, "jli").apply { mkdirs() }
                   val serverDir = File(aarch64Dir, "server").apply { mkdirs() }
 
-                  // KRİTİK: libpthread.so.0 eksikliğini aşmak için runtime klasöründe sahte/köprü .so dosyaları oluştur
+                  // KRİTİK: libdl.so.2, libpthread.so.0, libm.so.6, libc.so.6 eksikliklerini aşmak için runtime içinde köprüler oluştur
                   val sysLibDir = File("/system/lib64")
                   try {
-                      val pthreadLink = File(jreDir, "libpthread.so.0")
-                      if (!pthreadLink.exists()) {
-                          // Android içinde pthread fonksiyonları libc içindedir, libc.so'yu pthread olarak da bağla
-                          Runtime.getRuntime().exec(arrayOf("ln", "-sf", File(sysLibDir, "libc.so").absolutePath, pthreadLink.absolutePath)).waitFor()
+                      val links = mapOf(
+                          "libdl.so.2" to "libdl.so",
+                          "libpthread.so.0" to "libc.so",
+                          "libm.so.6" to "libm.so",
+                          "libc.so.6" to "libc.so"
+                      )
+                      for ((fakeName, realName) in links) {
+                          val linkFile = File(jreDir, fakeName)
+                          if (!linkFile.exists()) {
+                              val realFile = File(sysLibDir, realName)
+                              if (realFile.exists()) {
+                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", realFile.absolutePath, linkFile.absolutePath)).waitFor()
+                              }
+                          }
                       }
                   } catch (_: Exception) {}
 
@@ -277,7 +287,7 @@ jobs:
                       }
                   }
 
-                  onProgress(55, "Bionic JRE & Pthread Köprüsü Hazır!")
+                  onProgress(55, "Bionic JRE & glibc Köprüleri Hazır!")
                   return rtJar.exists()
               }
 
@@ -439,7 +449,6 @@ jobs:
                       val env = pb.environment()
                       env["HOME"] = mcDir.absolutePath
                       env["JAVA_HOME"] = jreDir.absolutePath
-                      // LD_LIBRARY_PATH içine jreDir de eklendi ki libpthread.so.0 köprüsü okunsun
                       env["LD_LIBRARY_PATH"] = "${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64:${jreDir.absolutePath}/lib/aarch64/jli:${jreDir.absolutePath}/lib/aarch64/server"
                       env["LIBGL_ES"] = "2"
                       env["LIBGL_MIPMAP"] = "3"
@@ -598,7 +607,7 @@ jobs:
                   }
 
                   val btnLaunch = Button(this).apply {
-                      text = "2. OYUNU BAŞLAT (PTHREAD KÖPRÜLÜ)"
+                      text = "2. OYUNU BAŞLAT (GLIBC KÖPRÜLÜ)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(
@@ -607,7 +616,7 @@ jobs:
                       ).apply { topMargin = 12 }
                   }
 
-                  leftPanel.apply {
+.leftPanel.apply {
                       addView(title)
                       addView(userEdit)
                       addView(versionSpinner)
@@ -628,7 +637,7 @@ jobs:
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru v1.5 Hazır]\nlibpthread.so.0 Bionic Köprüsü Aktif.\n"
+                      text = "[Axera Motoru v1.6 Hazır]\nTam glibc (libdl.so.2, libm, libc) Köprüleri Aktif.\n"
                   }
 
                   rootLayout.addView(leftScroll)
