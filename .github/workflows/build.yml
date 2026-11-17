@@ -67,7 +67,7 @@ jobs:
           android.useAndroidX=false
           EOF
 
-          # 4. app/build.gradle (Sifir ekstra kutuphane, maksimum performans)
+          # 4. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -82,8 +82,8 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0-Axera"
+                  versionCode 2
+                  versionName "1.1-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
                   }
@@ -139,7 +139,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt (JSON Parser, İndirme ve JRE Başlatma Motoru)
+          # 6. CoreMotor.kt (Canlı İlerleme Çubuğu Destekli İndirme ve Başlatma Motoru)
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
@@ -150,7 +150,11 @@ jobs:
           import java.net.HttpURLConnection
           import java.net.URL
 
-          class CoreMotor(private val context: Context, private val logger: (String) -> Unit) {
+          class CoreMotor(
+              private val context: Context,
+              private val logger: (String) -> Unit,
+              private val onProgress: (Int, String) -> Unit
+          ) {
 
               val mcDir = File(context.filesDir, ".minecraft")
               val versionsDir = File(mcDir, "versions")
@@ -165,9 +169,10 @@ jobs:
                   }
               }
 
-              // Mojang API'den sürüm verisini ve kütüphaneleri indirir
+              // Mojang API'den sürüm verisini ve kütüphaneleri canlı yüzde ile indirir
               fun prepareVersion(versionId: String): Boolean {
                   return try {
+                      onProgress(2, "Mojang manifest çekiliyor...")
                       logger("Mojang sunucularına bağlanılıyor ($versionId)...")
                       val manifestJson = fetchString("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
                       val versions = JSONObject(manifestJson).getJSONArray("versions")
@@ -183,9 +188,11 @@ jobs:
 
                       if (versionUrl == null) {
                           logger("HATA: Sürüm bulunamadı!")
+                          onProgress(0, "Hata: Sürüm bulunamadı")
                           return false
                       }
 
+                      onProgress(8, "$versionId JSON okunuyor...")
                       val vDir = File(versionsDir, versionId).apply { mkdirs() }
                       val vJsonFile = File(vDir, "$versionId.json")
                       val vJsonStr = fetchString(versionUrl)
@@ -197,34 +204,49 @@ jobs:
                       val clientUrl = vObj.getJSONObject("downloads").getJSONObject("client").getString("url")
                       val clientJar = File(vDir, "$versionId.jar")
                       if (!clientJar.exists()) {
+                          onProgress(15, "$versionId.jar indiriliyor...")
                           logger("$versionId.jar indiriliyor...")
                           downloadFile(clientUrl, clientJar)
+                      } else {
+                          onProgress(15, "$versionId.jar zaten mevcut.")
                       }
 
-                      // Kütüphaneleri indir
+                      // İndirilecek geçerli kütüphaneleri filtrele (gerçekçi yüzde hesabı için)
                       val libs = vObj.getJSONArray("libraries")
-                      var downloadedCount = 0
+                      val validLibs = mutableListOf<JSONObject>()
                       for (i in 0 until libs.length()) {
                           val lib = libs.getJSONObject(i)
                           if (!isLibAllowed(lib)) continue
+                          val artifact = lib.optJSONObject("downloads")?.optJSONObject("artifact") ?: continue
+                          validLibs.add(artifact)
+                      }
 
-                          val downloads = lib.optJSONObject("downloads") ?: continue
-                          val artifact = downloads.optJSONObject("artifact") ?: continue
+                      val totalLibs = validLibs.size.coerceAtLeast(1)
+                      var downloadedCount = 0
+
+                      for ((index, artifact) in validLibs.withIndex()) {
                           val path = artifact.getString("path")
                           val url = artifact.getString("url")
-                          
                           val libFile = File(librariesDir, path)
+
+                          // Yüzdeyi %15 ile %100 arasında oranla
+                          val currentPercent = 15 + (((index + 1) * 85) / totalLibs)
+                          onProgress(currentPercent, "Kütüphane (${index + 1}/$totalLibs): ${libFile.name}")
+
                           if (!libFile.exists()) {
                               libFile.parentFile?.mkdirs()
-                              logger("Kütüphane: ${libFile.name}")
+                              logger("İndiriliyor: ${libFile.name}")
                               downloadFile(url, libFile)
                               downloadedCount++
                           }
                       }
-                      logger("Kurulum tamam! ($downloadedCount yeni dosya indirildi)")
+
+                      onProgress(100, "$versionId Hazır! ($downloadedCount yeni dosya)")
+                      logger("Kurulum tamamlandı! Toplam $totalLibs kütüphane doğrulandı.")
                       true
                   } catch (e: Exception) {
                       logger("İndirme Hatası: ${e.message}")
+                      onProgress(0, "İndirme Hatası!")
                       false
                   }
               }
@@ -243,7 +265,6 @@ jobs:
                   return allow
               }
 
-              // Classpath dizilimini oluşturur
               private fun buildClasspath(versionId: String, vObj: JSONObject): String {
                   val cp = StringBuilder()
                   val libs = vObj.getJSONArray("libraries")
@@ -261,29 +282,36 @@ jobs:
                   return cp.toString()
               }
 
-              // Oyunu JRE ve GL4ES ile tetikler
+              // Oyunu canlı başlatma durumu ile tetikler
               fun launchGame(username: String, versionId: String, maxRamMb: Int) {
                   try {
+                      onProgress(10, "Sürüm dosyaları kontrol ediliyor...")
                       val vJsonFile = File(File(versionsDir, versionId), "$versionId.json")
                       if (!vJsonFile.exists()) {
                           logger("Önce sürümü indirmelisin!")
+                          onProgress(0, "Hata: Sürüm indirilmemiş!")
                           return
                       }
 
+                      onProgress(30, "Classpath ve argümanlar diziliyor...")
                       val vObj = JSONObject(vJsonFile.readText())
                       val mainClass = vObj.getString("mainClass")
                       val assetIndex = vObj.optString("assets", "legacy")
                       val classpath = buildClasspath(versionId, vObj)
 
+                      onProgress(55, "ARM64 JRE ve GL4ES kontrol ediliyor...")
                       val javaBin = File(jreDir, "bin/java")
                       if (!javaBin.exists()) {
                           logger("UYARI: ARM64 JRE bulunamadı (${javaBin.absolutePath}).")
                           logger("Classpath hazırlandı (${classpath.split(":").size} kütüphane).")
-                          logger("Oyun başlatma komutu simüle ediliyor...")
+                          logger("Ayrılan RAM: ${maxRamMb}MB | Hedef: $mainClass")
+                          onProgress(100, "Simülasyon Tamam (JRE Bekleniyor)")
+                          return
                       } else {
                           javaBin.setExecutable(true)
                       }
 
+                      onProgress(80, "JVM Parametreleri (${maxRamMb}MB RAM) hazırlanıyor...")
                       val cmd = mutableListOf(
                           javaBin.absolutePath,
                           "-Xms512M",
@@ -306,12 +334,9 @@ jobs:
                       )
 
                       logger("Başlatılıyor: $mainClass (RAM: ${maxRamMb}MB)")
-                      if (!javaBin.exists()) return
-
                       val pb = ProcessBuilder(cmd)
                       pb.directory(mcDir)
                       
-                      // Mali-T830 (OpenGL ES) ve ARM64 için ortam değişkenleri
                       val env = pb.environment()
                       env["HOME"] = mcDir.absolutePath
                       env["JAVA_HOME"] = jreDir.absolutePath
@@ -321,6 +346,7 @@ jobs:
                       env["LIBGL_NORMALIZE"] = "1"
 
                       pb.redirectErrorStream(true)
+                      onProgress(100, "Oyun Çalışıyor ($versionId)")
                       val process = pb.start()
 
                       process.inputStream.bufferedReader().useLines { lines ->
@@ -328,6 +354,7 @@ jobs:
                       }
                   } catch (e: Exception) {
                       logger("Çökme / Hata: ${e.message}")
+                      onProgress(0, "Başlatma Hatası!")
                   }
               }
 
@@ -348,11 +375,12 @@ jobs:
           }
           EOF
 
-          # 7. MainActivity.kt (Karanlık Tema, Sıfır XML, Saf Kod UI)
+          # 7. MainActivity.kt (Canlı ProgressBar ve 1.5GB Varsayılan RAM Kaydırıcısı)
           cat << 'EOF' > app/src/main/java/com/axera/launcher/MainActivity.kt
           package com.axera.launcher
 
           import android.app.Activity
+          import android.content.res.ColorStateList
           import android.graphics.Color
           import android.os.Bundle
           import android.text.method.ScrollingMovementMethod
@@ -363,35 +391,49 @@ jobs:
           class MainActivity : Activity() {
 
               private lateinit var logView: TextView
+              private lateinit var progressBar: ProgressBar
+              private lateinit var statusLabel: TextView
               private lateinit var motor: CoreMotor
+              
+              // Varsayılan RAM: 1536 MB (1.5 GB)
+              private var selectedRamMb: Int = 1536
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
-                  motor = CoreMotor(this) { msg ->
-                      runOnUiThread {
-                          logView.append("$msg\n")
+                  motor = CoreMotor(
+                      context = this,
+                      logger = { msg ->
+                          runOnUiThread { logView.append("$msg\n") }
+                      },
+                      onProgress = { percent, status ->
+                          runOnUiThread {
+                              progressBar.progress = percent
+                              statusLabel.text = "Durum: $status (%$percent)"
+                          }
                       }
-                  }
+                  )
 
-                  // Ana Tasarım (Yatay Ekran - Sol Panel Ayarlar, Sağ Panel Log/Konsol)
                   val rootLayout = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       setBackgroundColor(Color.parseColor("#121212"))
-                      setPadding(32, 32, 32, 32)
+                      setPadding(28, 24, 28, 24)
                   }
 
-                  // Sol Kontrol Paneli
-                  val leftPanel = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f).apply {
+                  // Sol Kontrol Paneli (Kaydırılabilir yapı, küçük ekranlarda taşmayı önler)
+                  val leftScroll = ScrollView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.1f).apply {
                           rightMargin = 24
                       }
                   }
 
+                  val leftPanel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+
                   val title = TextView(this).apply {
                       text = "AXERA MOBILE"
-                      textSize = 24f
+                      textSize = 22f
                       setTextColor(Color.parseColor("#00E676"))
                   }
 
@@ -407,9 +449,49 @@ jobs:
                       adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, versions)
                   }
 
+                  // RAM Ayarlama Bölümü (512 MB - 2560 MB arası, Varsayılan: 1536 MB / 1.5 GB)
+                  val minRam = 512
+                  val maxRam = 2560
                   val ramLabel = TextView(this).apply {
-                      text = "Verilecek RAM: 1150 MB (3GB Cihaz Optimize)"
+                      text = "Ayrılan RAM: 1536 MB (1.5 GB)"
+                      setTextColor(Color.parseColor("#64B5F6"))
+                      setPadding(0, 12, 0, 4)
+                  }
+
+                  val ramSeekBar = SeekBar(this).apply {
+                      max = maxRam - minRam
+                      progress = selectedRamMb - minRam // 1536 - 512 = 1024
+                      progressTintList = ColorStateList.valueOf(Color.parseColor("#00E676"))
+                      thumbTintList = ColorStateList.valueOf(Color.parseColor("#00E676"))
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                              // 64 MB katları şeklinde yuvarla
+                              val rawRam = minRam + progress
+                              selectedRamMb = (rawRam / 64) * 64
+                              val gbText = String.format("%.2f", selectedRamMb / 1024f)
+                              ramLabel.text = "Ayrılan RAM: $selectedRamMb MB ($gbText GB)"
+                          }
+                          override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                          override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                      })
+                  }
+
+                  // Canlı Yüzde ve Durum Çubuğu Bölümü
+                  statusLabel = TextView(this).apply {
+                      text = "Durum: Hazır (%0)"
                       setTextColor(Color.LTGRAY)
+                      textSize = 13f
+                      setPadding(0, 16, 0, 4)
+                  }
+
+                  progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100
+                      progress = 0
+                      progressTintList = ColorStateList.valueOf(Color.parseColor("#00E676"))
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          28
+                      ).apply { bottomMargin = 16 }
                   }
 
                   val btnDownload = Button(this).apply {
@@ -422,6 +504,10 @@ jobs:
                       text = "2. OYUNU BAŞLAT (TEK OYUNCULU)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = 12 }
                   }
 
                   leftPanel.apply {
@@ -429,23 +515,27 @@ jobs:
                       addView(userEdit)
                       addView(versionSpinner)
                       addView(ramLabel)
+                      addView(ramSeekBar)
+                      addView(statusLabel)
+                      addView(progressBar)
                       addView(btnDownload)
                       addView(btnLaunch)
                   }
+                  leftScroll.addView(leftPanel)
 
                   // Sağ Konsol Paneli
                   logView = TextView(this).apply {
-                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.5f)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.4f)
                       setBackgroundColor(Color.parseColor("#1E1E1E"))
                       setTextColor(Color.parseColor("#00FF00"))
                       textSize = 12f
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru Hazır]\nHedef: ARM64 + GL4ES (OpenGL ES 2.0/3.0)\n"
+                      text = "[Axera Motoru v1.1 Hazır]\nVarsayılan RAM: 1536 MB (1.5 GB)\nHedef: ARM64 + GL4ES\n"
                   }
 
-                  rootLayout.addView(leftPanel)
+                  rootLayout.addView(leftScroll)
                   rootLayout.addView(logView)
                   setContentView(rootLayout)
 
@@ -453,9 +543,13 @@ jobs:
                   btnDownload.setOnClickListener {
                       val ver = versionSpinner.selectedItem.toString()
                       btnDownload.isEnabled = false
+                      btnLaunch.isEnabled = false
                       thread {
                           motor.prepareVersion(ver)
-                          runOnUiThread { btnDownload.isEnabled = true }
+                          runOnUiThread {
+                              btnDownload.isEnabled = true
+                              btnLaunch.isEnabled = true
+                          }
                       }
                   }
 
@@ -463,7 +557,7 @@ jobs:
                       val user = userEdit.text.toString().ifBlank { "Erdem" }
                       val ver = versionSpinner.selectedItem.toString()
                       thread {
-                          motor.launchGame(user, ver, 1150)
+                          motor.launchGame(user, ver, selectedRamMb)
                       }
                   }
               }
