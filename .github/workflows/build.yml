@@ -28,28 +28,52 @@ jobs:
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Download & Bundle ARM64 JRE into APK
+      - name: Download & Bundle Android Bionic ARM64 JRE
         run: |
+          sudo apt-get update && sudo apt-get install -y patchelf xz-utils zip
+
           mkdir -p app/src/main/assets/jre_data
           mkdir -p app/src/main/jniLibs/arm64-v8a
-
-          echo "ARM64 OpenJDK 8 indiriliyor..."
-          curl -L "https://download.bell-sw.com/java/8u402+7/bellsoft-jre8u402+7-linux-aarch64.tar.gz" -o jre8.tar.gz
-          
           mkdir -p temp_jre
-          tar -xzf jre8.tar.gz -C temp_jre --strip-components=1
 
-          # 1. 'java' binary dosyasini Android'in calistirma izni verdigi jniLibs klasorune libjava_exec.so olarak koy
+          echo "Android Bionic ARM64 OpenJDK 8 indiriliyor..."
+          # PojavLauncher'ın doğrudan Android linker64 (Bionic) için derlediği JRE 8 arşivi
+          curl -L -f "https://github.com/PojavLauncherTeam/android-openjdk-build-multiarch/releases/download/1.8.0-20210725/Internal-jre8-arm64-20210725-release.tar.xz" -o jre_bionic.tar.xz || \
+          curl -L -f "https://raw.githubusercontent.com/PojavLauncherTeam/PojavLauncher/v3_openjdk/app_pojavlauncher/src/main/assets/components/jre/Internal.tar.xz" -o jre_bionic.tar.xz || true
+
+          if [ -s jre_bionic.tar.xz ]; then
+              tar -xJf jre_bionic.tar.xz -C temp_jre
+              # Eğer arşiv içinde universal.tar.xz ve bin-arm64.tar.xz varsa onları da aç
+              if [ -f temp_jre/universal.tar.xz ]; then
+                  tar -xJf temp_jre/universal.tar.xz -C temp_jre
+                  tar -xJf temp_jre/bin-arm64.tar.xz -C temp_jre
+                  rm -f temp_jre/*.tar.xz temp_jre/version
+              fi
+          fi
+
+          # Eğer bin/java hala yoksa yedek ARM64 JRE indir ve patchelf ile Android linker64 yaması uygula
+          if [ ! -f temp_jre/bin/java ]; then
+              echo "Yedek ARM64 JRE indiriliyor ve Android linker64 yaması uygulanıyor..."
+              curl -L "https://download.bell-sw.com/java/8u402+7/bellsoft-jre8u402+7-linux-aarch64.tar.gz" -o jre8.tar.gz
+              tar -xzf jre8.tar.gz -C temp_jre --strip-components=1
+              rm -f jre8.tar.gz
+          fi
+
+          # KRİTİK ADIM: ELF interpreter'ı Android'in /system/bin/linker64 yoluna sabitle (error=2 No such file hatasını çözer)
+          patchelf --set-interpreter /system/bin/linker64 temp_jre/bin/java || true
+
+          # 1. 'java' binary dosyasini jniLibs klasorune libjava_exec.so olarak koy
           cp temp_jre/bin/java app/src/main/jniLibs/arm64-v8a/libjava_exec.so
+          chmod 755 app/src/main/jniLibs/arm64-v8a/libjava_exec.so
 
           # 2. Tum native .so kutuphanelerini jniLibs icine kopyala
-          find temp_jre/lib/aarch64 -name "*.so" -exec cp {} app/src/main/jniLibs/arm64-v8a/ \;
+          find temp_jre/lib -name "*.so" -exec cp {} app/src/main/jniLibs/arm64-v8a/ \;
 
-          # 3. Geri kalan JRE dosyalarini (rt.jar, profiller, ayarlar) tek bir zip yapip assets icine koy
+          # 3. Geri kalan JRE dosyalarini (rt.jar, profiller, ayarlar) zip yapip assets icine koy
           cd temp_jre
           zip -r -q ../app/src/main/assets/jre_data/jre_runtime.zip lib
           cd ..
-          rm -rf temp_jre jre8.tar.gz
+          rm -rf temp_jre jre_bionic.tar.xz
 
       - name: Generate Project Structure & Code
         run: |
@@ -105,8 +129,8 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 4
-                  versionName "1.3-Axera"
+                  versionCode 5
+                  versionName "1.4-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
                   }
@@ -137,7 +161,6 @@ jobs:
           }
 
           dependencies {
-              // Sifir harici bagimlilik! JRE dogrudan APK icine gomuldu.
           }
           EOF
 
@@ -169,7 +192,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt (APK İçinden Gömülü JRE Çıkartıcı + Başlatıcı)
+          # 6. CoreMotor.kt
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
@@ -200,7 +223,6 @@ jobs:
                   }
               }
 
-              // APK içindeki gömülü JRE paketini internet kullanmadan saniyeler içinde çıkartır
               fun ensureEmbeddedJreReady(): Boolean {
                   val rtJar = File(jreDir, "lib/rt.jar")
                   val nativeDir = File(context.applicationInfo.nativeLibraryDir)
@@ -211,60 +233,57 @@ jobs:
                       return false
                   }
 
-                  if (rtJar.exists()) {
-                      return true
-                  }
+                  val aarch64Dir = File(jreDir, "lib/aarch64").apply { mkdirs() }
+                  val jliDir = File(aarch64Dir, "jli").apply { mkdirs() }
+                  val serverDir = File(aarch64Dir, "server").apply { mkdirs() }
 
-                  return try {
-                      onProgress(20, "Gömülü ARM64 JRE çıkartılıyor (Offline)...")
-                      logger("APK içindeki gömülü ARM64 JRE çıkartılıyor...")
+                  if (!rtJar.exists()) {
+                      try {
+                          onProgress(20, "Gömülü Bionic ARM64 JRE çıkartılıyor...")
+                          logger("APK içindeki Bionic ARM64 JRE çıkartılıyor...")
 
-                      context.assets.open("jre_data/jre_runtime.zip").use { input ->
-                          ZipInputStream(input).use { zis ->
-                              var entry = zis.nextEntry
-                              while (entry != null) {
-                                  val outFile = File(jreDir, entry.name)
-                                  if (entry.isDirectory) {
-                                      outFile.mkdirs()
-                                  } else {
-                                      outFile.parentFile?.mkdirs()
-                                      FileOutputStream(outFile).use { fos ->
-                                          zis.copyTo(fos)
+                          context.assets.open("jre_data/jre_runtime.zip").use { input ->
+                              ZipInputStream(input).use { zis ->
+                                  var entry = zis.nextEntry
+                                  while (entry != null) {
+                                      val outFile = File(jreDir, entry.name)
+                                      if (entry.isDirectory) {
+                                          outFile.mkdirs()
+                                      } else {
+                                          outFile.parentFile?.mkdirs()
+                                          FileOutputStream(outFile).use { fos ->
+                                              zis.copyTo(fos)
+                                          }
                                       }
+                                      zis.closeEntry()
+                                      entry = zis.nextEntry
                                   }
-                                  zis.closeEntry()
-                                  entry = zis.nextEntry
                               }
                           }
+                      } catch (e: Exception) {
+                          logger("Gömülü JRE Çıkartma Hatası: ${e.message}")
+                          onProgress(0, "JRE Hatası!")
+                          return false
                       }
-
-                      // Native .so dosyalarını JRE'nin beklediği dizinlere sembolik link/kopya olarak bağla
-                      val aarch64Dir = File(jreDir, "lib/aarch64").apply { mkdirs() }
-                      val jliDir = File(aarch64Dir, "jli").apply { mkdirs() }
-                      val serverDir = File(aarch64Dir, "server").apply { mkdirs() }
-
-                      nativeDir.listFiles()?.forEach { soFile ->
-                          if (soFile.name.endsWith(".so") && soFile.name != "libjava_exec.so") {
-                              try {
-                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(aarch64Dir, soFile.name).absolutePath)).waitFor()
-                                  if (soFile.name == "libjli.so") {
-                                      Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(jliDir, soFile.name).absolutePath)).waitFor()
-                                  }
-                                  if (soFile.name == "libjvm.so") {
-                                      Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(serverDir, soFile.name).absolutePath)).waitFor()
-                                  }
-                              } catch (_: Exception) {}
-                          }
-                      }
-
-                      onProgress(55, "Gömülü JRE Hazır!")
-                      logger("Gömülü ARM64 JRE başarıyla kuruldu!")
-                      rtJar.exists()
-                  } catch (e: Exception) {
-                      logger("Gömülü JRE Çıkartma Hatası: ${e.message}")
-                      onProgress(0, "JRE Hatası!")
-                      false
                   }
+
+                  // Her başlatmada native .so sembolik linklerini doğrula (APK güncellendiğinde değişen yol için)
+                  nativeDir.listFiles()?.forEach { soFile ->
+                      if (soFile.name.endsWith(".so") && soFile.name != "libjava_exec.so") {
+                          try {
+                              Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(aarch64Dir, soFile.name).absolutePath)).waitFor()
+                              if (soFile.name == "libjli.so") {
+                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(jliDir, soFile.name).absolutePath)).waitFor()
+                              }
+                              if (soFile.name == "libjvm.so") {
+                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(serverDir, soFile.name).absolutePath)).waitFor()
+                              }
+                          } catch (_: Exception) {}
+                      }
+                  }
+
+                  onProgress(55, "Bionic JRE Hazır!")
+                  return rtJar.exists()
               }
 
               fun prepareVersion(versionId: String): Boolean {
@@ -583,7 +602,7 @@ jobs:
                   }
 
                   val btnLaunch = Button(this).apply {
-                      text = "2. OYUNU BAŞLAT (GÖMÜLÜ JRE 8)"
+                      text = "2. OYUNU BAŞLAT (BIONIC JRE 8)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(
@@ -613,7 +632,7 @@ jobs:
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru v1.3 Hazır]\nGömülü ARM64 OpenJDK 8 Aktif (Offline Kurulum).\n"
+                      text = "[Axera Motoru v1.4 Hazır]\nAndroid Bionic Linker64 + Gömülü ARM64 JRE 8 Aktif.\n"
                   }
 
                   rootLayout.addView(leftScroll)
