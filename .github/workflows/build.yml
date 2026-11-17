@@ -67,7 +67,7 @@ jobs:
           android.useAndroidX=false
           EOF
 
-          # 4. app/build.gradle
+          # 4. app/build.gradle (JRE .tar.xz arşivlerini açmak için hafif XZ kütüphanesi eklendi)
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -82,10 +82,16 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 2
-                  versionName "1.1-Axera"
+                  versionCode 3
+                  versionName "1.2-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
+                  }
+              }
+
+              packagingOptions {
+                  jniLibs {
+                      useLegacyPackaging true
                   }
               }
 
@@ -108,7 +114,9 @@ jobs:
           }
 
           dependencies {
-              // Sifir harici bagimlilik! Saf Android SDK ve Kotlin.
+              // Sadece ARM64 JRE tar.xz arşivini telefonda açmak için gereken 2 mini kütüphane
+              implementation 'org.tukaani:xz:1.9'
+              implementation 'org.apache.commons:commons-compress:1.26.0'
           }
           EOF
 
@@ -124,6 +132,7 @@ jobs:
                   android:label="Axera Launcher"
                   android:largeHeap="true"
                   android:hardwareAccelerated="true"
+                  android:extractNativeLibs="true"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
                   <activity
                       android:name=".MainActivity"
@@ -139,16 +148,21 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt (Canlı İlerleme Çubuğu Destekli İndirme ve Başlatma Motoru)
+          # 6. CoreMotor.kt (Otomatik ARM64 JRE İndirici + Tar.XZ Açıcı + Başlatıcı)
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
           import android.content.Context
+          import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+          import org.tukaani.xz.XZInputStream
           import org.json.JSONObject
+          import java.io.BufferedInputStream
           import java.io.File
+          import java.io.FileInputStream
           import java.io.FileOutputStream
           import java.net.HttpURLConnection
           import java.net.URL
+          import java.util.zip.ZipFile
 
           class CoreMotor(
               private val context: Context,
@@ -163,13 +177,98 @@ jobs:
               val nativesDir = File(mcDir, "natives")
               val jreDir = File(context.filesDir, "runtime/jre")
 
+              // Android ARM64 için derlenmiş OpenJDK 8 paketi (1.8.9 - 1.16.5 uyumlu)
+              private val jreArm64Url = "https://github.com/PojavLauncherTeam/android-openjdk-build-multiarch/releases/download/1.8.0-20210725/Internal-jre8-arm64-20210725-release.tar.xz"
+
               init {
                   listOf(mcDir, versionsDir, librariesDir, assetsDir, nativesDir, jreDir).forEach {
                       if (!it.exists()) it.mkdirs()
                   }
               }
 
-              // Mojang API'den sürüm verisini ve kütüphaneleri canlı yüzde ile indirir
+              // ARM64 JRE yoksa otomatik indirir ve çıkartır
+              fun ensureJreInstalled(): Boolean {
+                  val javaBin = File(jreDir, "bin/java")
+                  if (javaBin.exists()) {
+                      setPermissionsRecursive(jreDir)
+                      return true
+                  }
+
+                  return try {
+                      onProgress(5, "ARM64 JRE 8 İndiriliyor (~40 MB)...")
+                      logger("ARM64 JRE bulunamadı. Otomatik indiriliyor...")
+                      val archiveFile = File(context.filesDir, "jre8-arm64.tar.xz")
+                      
+                      downloadFileWithProgress(jreArm64Url, archiveFile) { dlPercent ->
+                          val mapped = 5 + ((dlPercent * 50) / 100)
+                          onProgress(mapped, "ARM64 JRE İndiriliyor (%$dlPercent)...")
+                      }
+
+                      onProgress(60, "ARM64 JRE Çıkartılıyor (Lütfen bekleyin)...")
+                      logger("JRE arşivi açılıyor: ${jreDir.absolutePath}")
+                      extractTarXz(archiveFile, jreDir)
+                      archiveFile.delete()
+
+                      // İç içe klasör çıktıysa düzelt ve izinleri ver
+                      val nestedBin = jreDir.walkTopDown().firstOrNull { it.name == "java" && it.parentFile?.name == "bin" }
+                      if (nestedBin != null && nestedBin.absolutePath != javaBin.absolutePath) {
+                          val actualRoot = nestedBin.parentFile?.parentFile
+                          actualRoot?.listFiles()?.forEach { file ->
+                              file.renameTo(File(jreDir, file.name))
+                          }
+                      }
+
+                      setPermissionsRecursive(jreDir)
+                      onProgress(100, "ARM64 JRE Başarıyla Kuruldu!")
+                      logger("JRE kurulumu tamamlandı: ${javaBin.exists()}")
+                      javaBin.exists()
+                  } catch (e: Exception) {
+                      logger("JRE Kurulum Hatası: ${e.message}")
+                      onProgress(0, "JRE Kurulum Hatası!")
+                      false
+                  }
+              }
+
+              private fun extractTarXz(tarXzFile: File, destDir: File) {
+                  FileInputStream(tarXzFile).use { fis ->
+                      BufferedInputStream(fis).use { bis ->
+                          XZInputStream(bis).use { xzis ->
+                              TarArchiveInputStream(xzis).use { tis ->
+                                  var entry = tis.nextTarEntry
+                                  while (entry != null) {
+                                      val outFile = File(destDir, entry.name)
+                                      if (entry.isDirectory) {
+                                          outFile.mkdirs()
+                                      } else {
+                                          outFile.parentFile?.mkdirs()
+                                          if (entry.isSymbolicLink) {
+                                              // Sembolik linkleri kopyala veya bağla
+                                              try {
+                                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", entry.linkName, outFile.absolutePath)).waitFor()
+                                              } catch (_: Exception) {}
+                                          } else {
+                                              FileOutputStream(outFile).use { fos ->
+                                                  tis.copyTo(fos)
+                                              }
+                                          }
+                                      }
+                                      entry = tis.nextTarEntry
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun setPermissionsRecursive(dir: File) {
+                  dir.walkTopDown().forEach { file ->
+                      file.setReadable(true, false)
+                      if (file.isDirectory || file.parentFile?.name == "bin" || file.name.endsWith(".so") || file.name.contains(".so.")) {
+                          file.setExecutable(true, false)
+                      }
+                  }
+              }
+
               fun prepareVersion(versionId: String): Boolean {
                   return try {
                       onProgress(2, "Mojang manifest çekiliyor...")
@@ -200,18 +299,14 @@ jobs:
 
                       val vObj = JSONObject(vJsonStr)
                       
-                      // Client.jar indir
                       val clientUrl = vObj.getJSONObject("downloads").getJSONObject("client").getString("url")
                       val clientJar = File(vDir, "$versionId.jar")
                       if (!clientJar.exists()) {
                           onProgress(15, "$versionId.jar indiriliyor...")
                           logger("$versionId.jar indiriliyor...")
                           downloadFile(clientUrl, clientJar)
-                      } else {
-                          onProgress(15, "$versionId.jar zaten mevcut.")
                       }
 
-                      // İndirilecek geçerli kütüphaneleri filtrele (gerçekçi yüzde hesabı için)
                       val libs = vObj.getJSONArray("libraries")
                       val validLibs = mutableListOf<JSONObject>()
                       for (i in 0 until libs.length()) {
@@ -229,7 +324,6 @@ jobs:
                           val url = artifact.getString("url")
                           val libFile = File(librariesDir, path)
 
-                          // Yüzdeyi %15 ile %100 arasında oranla
                           val currentPercent = 15 + (((index + 1) * 85) / totalLibs)
                           onProgress(currentPercent, "Kütüphane (${index + 1}/$totalLibs): ${libFile.name}")
 
@@ -282,45 +376,43 @@ jobs:
                   return cp.toString()
               }
 
-              // Oyunu canlı başlatma durumu ile tetikler
               fun launchGame(username: String, versionId: String, maxRamMb: Int) {
                   try {
-                      onProgress(10, "Sürüm dosyaları kontrol ediliyor...")
                       val vJsonFile = File(File(versionsDir, versionId), "$versionId.json")
                       if (!vJsonFile.exists()) {
-                          logger("Önce sürümü indirmelisin!")
-                          onProgress(0, "Hata: Sürüm indirilmemiş!")
+                          logger("HATA: Önce '1. Sürümü ve Kütüphaneleri İndir' butonuna basmalısın!")
+                          onProgress(0, "Sürüm indirilmemiş!")
                           return
                       }
 
-                      onProgress(30, "Classpath ve argümanlar diziliyor...")
+                      // 1. JRE Kontrolü ve Otomatik İndirme
+                      if (!ensureJreInstalled()) {
+                          logger("HATA: ARM64 JRE kurulamadığı için başlatma iptal edildi.")
+                          return
+                      }
+
+                      onProgress(70, "Classpath ve argümanlar diziliyor...")
                       val vObj = JSONObject(vJsonFile.readText())
                       val mainClass = vObj.getString("mainClass")
                       val assetIndex = vObj.optString("assets", "legacy")
                       val classpath = buildClasspath(versionId, vObj)
 
-                      onProgress(55, "ARM64 JRE ve GL4ES kontrol ediliyor...")
                       val javaBin = File(jreDir, "bin/java")
-                      if (!javaBin.exists()) {
-                          logger("UYARI: ARM64 JRE bulunamadı (${javaBin.absolutePath}).")
-                          logger("Classpath hazırlandı (${classpath.split(":").size} kütüphane).")
-                          logger("Ayrılan RAM: ${maxRamMb}MB | Hedef: $mainClass")
-                          onProgress(100, "Simülasyon Tamam (JRE Bekleniyor)")
-                          return
-                      } else {
-                          javaBin.setExecutable(true)
-                      }
+                      javaBin.setExecutable(true, false)
 
-                      onProgress(80, "JVM Parametreleri (${maxRamMb}MB RAM) hazırlanıyor...")
+                      val jreLibDir = File(jreDir, "lib/aarch64")
+                      val jliDir = File(jreLibDir, "jli")
+                      val serverDir = File(jreLibDir, "server")
+
+                      onProgress(85, "JVM (${maxRamMb}MB RAM) ateşleniyor...")
                       val cmd = mutableListOf(
                           javaBin.absolutePath,
                           "-Xms512M",
                           "-Xmx${maxRamMb}M",
-                          "-XX:+UseG1GC",
-                          "-XX:+ParallelRefProcEnabled",
-                          "-XX:MaxGCPauseMillis=200",
-                          "-Djava.library.path=${nativesDir.absolutePath}",
-                          "-Dorg.lwjgl.opengl.libname=libgl4es_114.so",
+                          "-Djava.library.path=${nativesDir.absolutePath}:${jreLibDir.absolutePath}",
+                          "-Djna.nosys=true",
+                          "-Dorg.lwjgl.util.Debug=true",
+                          "-Dorg.lwjgl.util.DebugLoader=true",
                           "-cp", classpath,
                           mainClass,
                           "--username", username,
@@ -340,42 +432,69 @@ jobs:
                       val env = pb.environment()
                       env["HOME"] = mcDir.absolutePath
                       env["JAVA_HOME"] = jreDir.absolutePath
-                      env["LD_LIBRARY_PATH"] = "${nativesDir.absolutePath}:${jreDir.absolutePath}/lib:${jreDir.absolutePath}/lib/jli"
+                      env["LD_LIBRARY_PATH"] = "${nativesDir.absolutePath}:${jreLibDir.absolutePath}:${jliDir.absolutePath}:${serverDir.absolutePath}"
                       env["LIBGL_ES"] = "2"
                       env["LIBGL_MIPMAP"] = "3"
-                      env["LIBGL_NORMALIZE"] = "1"
 
                       pb.redirectErrorStream(true)
-                      onProgress(100, "Oyun Çalışıyor ($versionId)")
+                      onProgress(100, "JVM Çalışıyor ($versionId)")
                       val process = pb.start()
 
                       process.inputStream.bufferedReader().useLines { lines ->
                           lines.forEach { logger("[JVM] $it") }
                       }
+                      val exitCode = process.waitFor()
+                      logger("JVM kapandı (Çıkış Kodu: $exitCode)")
+                      onProgress(0, "Oyun Kapandı (Kod: $exitCode)")
                   } catch (e: Exception) {
-                      logger("Çökme / Hata: ${e.message}")
+                      logger("Başlatma Hatası: ${e.message}")
                       onProgress(0, "Başlatma Hatası!")
                   }
               }
 
               private fun fetchString(urlStr: String): String {
                   val conn = URL(urlStr).openConnection() as HttpURLConnection
-                  conn.connectTimeout = 10000
+                  conn.connectTimeout = 15000
                   return conn.inputStream.bufferedReader().readText()
               }
 
               private fun downloadFile(urlStr: String, dest: File) {
                   val conn = URL(urlStr).openConnection() as HttpURLConnection
+                  conn.instanceFollowRedirects = true
                   conn.inputStream.use { input ->
                       FileOutputStream(dest).use { output ->
                           input.copyTo(output)
                       }
                   }
               }
+
+              private fun downloadFileWithProgress(urlStr: String, dest: File, onPercent: (Int) -> Unit) {
+                  val conn = URL(urlStr).openConnection() as HttpURLConnection
+                  conn.instanceFollowRedirects = true
+                  val totalSize = conn.contentLength.coerceAtLeast(1)
+                  var downloaded = 0L
+                  var lastReported = -1
+
+                  conn.inputStream.use { input ->
+                      FileOutputStream(dest).use { output ->
+                          val buffer = ByteArray(8192)
+                          var bytesRead: Int
+                          while (input.read(buffer).also { bytesRead = it } != -1) {
+                              output.write(buffer, 0, bytesRead)
+                              downloaded += bytesRead
+                              val pct = ((downloaded * 100) / totalSize).toInt().coerceIn(0, 100)
+                              if (pct != lastReported) {
+                                  lastReported = pct
+                                  onPercent(pct)
+                              }
+                          }
+                      }
+                  }
+              }
           }
           EOF
 
-          # 7. MainActivity.kt (Canlı ProgressBar ve 1.5GB Varsayılan RAM Kaydırıcısı)
+          # 7. MainActivity.kt
           cat << 'EOF' > app/src/main/java/com/axera/launcher/MainActivity.kt
           package com.axera.launcher
 
@@ -394,8 +513,6 @@ jobs:
               private lateinit var progressBar: ProgressBar
               private lateinit var statusLabel: TextView
               private lateinit var motor: CoreMotor
-              
-              // Varsayılan RAM: 1536 MB (1.5 GB)
               private var selectedRamMb: Int = 1536
 
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -420,7 +537,6 @@ jobs:
                       setPadding(28, 24, 28, 24)
                   }
 
-                  // Sol Kontrol Paneli (Kaydırılabilir yapı, küçük ekranlarda taşmayı önler)
                   val leftScroll = ScrollView(this).apply {
                       layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.1f).apply {
                           rightMargin = 24
@@ -445,11 +561,10 @@ jobs:
                   }
 
                   val versionSpinner = Spinner(this).apply {
-                      val versions = arrayOf("1.8.9", "1.12.2", "1.16.5", "1.20.4", "1.21.11")
+                      val versions = arrayOf("1.8.9", "1.12.2", "1.16.5")
                       adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, versions)
                   }
 
-                  // RAM Ayarlama Bölümü (512 MB - 2560 MB arası, Varsayılan: 1536 MB / 1.5 GB)
                   val minRam = 512
                   val maxRam = 2560
                   val ramLabel = TextView(this).apply {
@@ -460,12 +575,11 @@ jobs:
 
                   val ramSeekBar = SeekBar(this).apply {
                       max = maxRam - minRam
-                      progress = selectedRamMb - minRam // 1536 - 512 = 1024
+                      progress = selectedRamMb - minRam
                       progressTintList = ColorStateList.valueOf(Color.parseColor("#00E676"))
                       thumbTintList = ColorStateList.valueOf(Color.parseColor("#00E676"))
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                              // 64 MB katları şeklinde yuvarla
                               val rawRam = minRam + progress
                               selectedRamMb = (rawRam / 64) * 64
                               val gbText = String.format("%.2f", selectedRamMb / 1024f)
@@ -476,7 +590,6 @@ jobs:
                       })
                   }
 
-                  // Canlı Yüzde ve Durum Çubuğu Bölümü
                   statusLabel = TextView(this).apply {
                       text = "Durum: Hazır (%0)"
                       setTextColor(Color.LTGRAY)
@@ -501,7 +614,7 @@ jobs:
                   }
 
                   val btnLaunch = Button(this).apply {
-                      text = "2. OYUNU BAŞLAT (TEK OYUNCULU)"
+                      text = "2. OYUNU BAŞLAT (OTO-JRE + JVM)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(
@@ -523,23 +636,21 @@ jobs:
                   }
                   leftScroll.addView(leftPanel)
 
-                  // Sağ Konsol Paneli
                   logView = TextView(this).apply {
                       layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.4f)
                       setBackgroundColor(Color.parseColor("#1E1E1E"))
                       setTextColor(Color.parseColor("#00FF00"))
-                      textSize = 12f
+                      textSize = 11f
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru v1.1 Hazır]\nVarsayılan RAM: 1536 MB (1.5 GB)\nHedef: ARM64 + GL4ES\n"
+                      text = "[Axera Motoru v1.2 Hazır]\nOtomatik ARM64 OpenJDK 8 İndirici Aktif.\n"
                   }
 
                   rootLayout.addView(leftScroll)
                   rootLayout.addView(logView)
                   setContentView(rootLayout)
 
-                  // Buton Aksiyonları
                   btnDownload.setOnClickListener {
                       val ver = versionSpinner.selectedItem.toString()
                       btnDownload.isEnabled = false
@@ -556,8 +667,10 @@ jobs:
                   btnLaunch.setOnClickListener {
                       val user = userEdit.text.toString().ifBlank { "Erdem" }
                       val ver = versionSpinner.selectedItem.toString()
+                      btnLaunch.isEnabled = false
                       thread {
                           motor.launchGame(user, ver, selectedRamMb)
+                          runOnUiThread { btnLaunch.isEnabled = true }
                       }
                   }
               }
