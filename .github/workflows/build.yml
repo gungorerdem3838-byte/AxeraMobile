@@ -28,6 +28,29 @@ jobs:
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
+      - name: Download & Bundle ARM64 JRE into APK
+        run: |
+          mkdir -p app/src/main/assets/jre_data
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+
+          echo "ARM64 OpenJDK 8 indiriliyor..."
+          curl -L "https://download.bell-sw.com/java/8u402+7/bellsoft-jre8u402+7-linux-aarch64.tar.gz" -o jre8.tar.gz
+          
+          mkdir -p temp_jre
+          tar -xzf jre8.tar.gz -C temp_jre --strip-components=1
+
+          # 1. 'java' binary dosyasini Android'in calistirma izni verdigi jniLibs klasorune libjava_exec.so olarak koy
+          cp temp_jre/bin/java app/src/main/jniLibs/arm64-v8a/libjava_exec.so
+
+          # 2. Tum native .so kutuphanelerini jniLibs icine kopyala
+          find temp_jre/lib/aarch64 -name "*.so" -exec cp {} app/src/main/jniLibs/arm64-v8a/ \;
+
+          # 3. Geri kalan JRE dosyalarini (rt.jar, profiller, ayarlar) tek bir zip yapip assets icine koy
+          cd temp_jre
+          zip -r -q ../app/src/main/assets/jre_data/jre_runtime.zip lib
+          cd ..
+          rm -rf temp_jre jre8.tar.gz
+
       - name: Generate Project Structure & Code
         run: |
           mkdir -p app/src/main/java/com/axera/launcher
@@ -67,7 +90,7 @@ jobs:
           android.useAndroidX=false
           EOF
 
-          # 4. app/build.gradle (JRE .tar.xz arşivlerini açmak için hafif XZ kütüphanesi eklendi)
+          # 4. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -82,8 +105,8 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 3
-                  versionName "1.2-Axera"
+                  versionCode 4
+                  versionName "1.3-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
                   }
@@ -93,12 +116,12 @@ jobs:
                   jniLibs {
                       useLegacyPackaging true
                   }
+                  doNotStrip "**/*.so"
               }
 
               buildTypes {
                   release {
-                      minifyEnabled true
-                      shrinkResources true
+                      minifyEnabled false
                   }
                   debug {
                       minifyEnabled false
@@ -114,9 +137,7 @@ jobs:
           }
 
           dependencies {
-              // Sadece ARM64 JRE tar.xz arşivini telefonda açmak için gereken 2 mini kütüphane
-              implementation 'org.tukaani:xz:1.9'
-              implementation 'org.apache.commons:commons-compress:1.26.0'
+              // Sifir harici bagimlilik! JRE dogrudan APK icine gomuldu.
           }
           EOF
 
@@ -148,21 +169,17 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt (Otomatik ARM64 JRE İndirici + Tar.XZ Açıcı + Başlatıcı)
+          # 6. CoreMotor.kt (APK İçinden Gömülü JRE Çıkartıcı + Başlatıcı)
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
           import android.content.Context
-          import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-          import org.tukaani.xz.XZInputStream
           import org.json.JSONObject
-          import java.io.BufferedInputStream
           import java.io.File
-          import java.io.FileInputStream
           import java.io.FileOutputStream
           import java.net.HttpURLConnection
           import java.net.URL
-          import java.util.zip.ZipFile
+          import java.util.zip.ZipInputStream
 
           class CoreMotor(
               private val context: Context,
@@ -177,95 +194,76 @@ jobs:
               val nativesDir = File(mcDir, "natives")
               val jreDir = File(context.filesDir, "runtime/jre")
 
-              // Android ARM64 için derlenmiş OpenJDK 8 paketi (1.8.9 - 1.16.5 uyumlu)
-              private val jreArm64Url = "https://github.com/PojavLauncherTeam/android-openjdk-build-multiarch/releases/download/1.8.0-20210725/Internal-jre8-arm64-20210725-release.tar.xz"
-
               init {
                   listOf(mcDir, versionsDir, librariesDir, assetsDir, nativesDir, jreDir).forEach {
                       if (!it.exists()) it.mkdirs()
                   }
               }
 
-              // ARM64 JRE yoksa otomatik indirir ve çıkartır
-              fun ensureJreInstalled(): Boolean {
-                  val javaBin = File(jreDir, "bin/java")
-                  if (javaBin.exists()) {
-                      setPermissionsRecursive(jreDir)
+              // APK içindeki gömülü JRE paketini internet kullanmadan saniyeler içinde çıkartır
+              fun ensureEmbeddedJreReady(): Boolean {
+                  val rtJar = File(jreDir, "lib/rt.jar")
+                  val nativeDir = File(context.applicationInfo.nativeLibraryDir)
+                  val javaExec = File(nativeDir, "libjava_exec.so")
+
+                  if (!javaExec.exists()) {
+                      logger("HATA: Gömülü Java motoru bulunamadı (${javaExec.absolutePath})")
+                      return false
+                  }
+
+                  if (rtJar.exists()) {
                       return true
                   }
 
                   return try {
-                      onProgress(5, "ARM64 JRE 8 İndiriliyor (~40 MB)...")
-                      logger("ARM64 JRE bulunamadı. Otomatik indiriliyor...")
-                      val archiveFile = File(context.filesDir, "jre8-arm64.tar.xz")
-                      
-                      downloadFileWithProgress(jreArm64Url, archiveFile) { dlPercent ->
-                          val mapped = 5 + ((dlPercent * 50) / 100)
-                          onProgress(mapped, "ARM64 JRE İndiriliyor (%$dlPercent)...")
-                      }
+                      onProgress(20, "Gömülü ARM64 JRE çıkartılıyor (Offline)...")
+                      logger("APK içindeki gömülü ARM64 JRE çıkartılıyor...")
 
-                      onProgress(60, "ARM64 JRE Çıkartılıyor (Lütfen bekleyin)...")
-                      logger("JRE arşivi açılıyor: ${jreDir.absolutePath}")
-                      extractTarXz(archiveFile, jreDir)
-                      archiveFile.delete()
-
-                      // İç içe klasör çıktıysa düzelt ve izinleri ver
-                      val nestedBin = jreDir.walkTopDown().firstOrNull { it.name == "java" && it.parentFile?.name == "bin" }
-                      if (nestedBin != null && nestedBin.absolutePath != javaBin.absolutePath) {
-                          val actualRoot = nestedBin.parentFile?.parentFile
-                          actualRoot?.listFiles()?.forEach { file ->
-                              file.renameTo(File(jreDir, file.name))
-                          }
-                      }
-
-                      setPermissionsRecursive(jreDir)
-                      onProgress(100, "ARM64 JRE Başarıyla Kuruldu!")
-                      logger("JRE kurulumu tamamlandı: ${javaBin.exists()}")
-                      javaBin.exists()
-                  } catch (e: Exception) {
-                      logger("JRE Kurulum Hatası: ${e.message}")
-                      onProgress(0, "JRE Kurulum Hatası!")
-                      false
-                  }
-              }
-
-              private fun extractTarXz(tarXzFile: File, destDir: File) {
-                  FileInputStream(tarXzFile).use { fis ->
-                      BufferedInputStream(fis).use { bis ->
-                          XZInputStream(bis).use { xzis ->
-                              TarArchiveInputStream(xzis).use { tis ->
-                                  var entry = tis.nextTarEntry
-                                  while (entry != null) {
-                                      val outFile = File(destDir, entry.name)
-                                      if (entry.isDirectory) {
-                                          outFile.mkdirs()
-                                      } else {
-                                          outFile.parentFile?.mkdirs()
-                                          if (entry.isSymbolicLink) {
-                                              // Sembolik linkleri kopyala veya bağla
-                                              try {
-                                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", entry.linkName, outFile.absolutePath)).waitFor()
-                                              } catch (_: Exception) {}
-                                          } else {
-                                              FileOutputStream(outFile).use { fos ->
-                                                  tis.copyTo(fos)
-                                              }
-                                          }
+                      context.assets.open("jre_data/jre_runtime.zip").use { input ->
+                          ZipInputStream(input).use { zis ->
+                              var entry = zis.nextEntry
+                              while (entry != null) {
+                                  val outFile = File(jreDir, entry.name)
+                                  if (entry.isDirectory) {
+                                      outFile.mkdirs()
+                                  } else {
+                                      outFile.parentFile?.mkdirs()
+                                      FileOutputStream(outFile).use { fos ->
+                                          zis.copyTo(fos)
                                       }
-                                      entry = tis.nextTarEntry
                                   }
+                                  zis.closeEntry()
+                                  entry = zis.nextEntry
                               }
                           }
                       }
-                  }
-              }
 
-              private fun setPermissionsRecursive(dir: File) {
-                  dir.walkTopDown().forEach { file ->
-                      file.setReadable(true, false)
-                      if (file.isDirectory || file.parentFile?.name == "bin" || file.name.endsWith(".so") || file.name.contains(".so.")) {
-                          file.setExecutable(true, false)
+                      // Native .so dosyalarını JRE'nin beklediği dizinlere sembolik link/kopya olarak bağla
+                      val aarch64Dir = File(jreDir, "lib/aarch64").apply { mkdirs() }
+                      val jliDir = File(aarch64Dir, "jli").apply { mkdirs() }
+                      val serverDir = File(aarch64Dir, "server").apply { mkdirs() }
+
+                      nativeDir.listFiles()?.forEach { soFile ->
+                          if (soFile.name.endsWith(".so") && soFile.name != "libjava_exec.so") {
+                              try {
+                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(aarch64Dir, soFile.name).absolutePath)).waitFor()
+                                  if (soFile.name == "libjli.so") {
+                                      Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(jliDir, soFile.name).absolutePath)).waitFor()
+                                  }
+                                  if (soFile.name == "libjvm.so") {
+                                      Runtime.getRuntime().exec(arrayOf("ln", "-sf", soFile.absolutePath, File(serverDir, soFile.name).absolutePath)).waitFor()
+                                  }
+                              } catch (_: Exception) {}
+                          }
                       }
+
+                      onProgress(55, "Gömülü JRE Hazır!")
+                      logger("Gömülü ARM64 JRE başarıyla kuruldu!")
+                      rtJar.exists()
+                  } catch (e: Exception) {
+                      logger("Gömülü JRE Çıkartma Hatası: ${e.message}")
+                      onProgress(0, "JRE Hatası!")
+                      false
                   }
               }
 
@@ -385,9 +383,7 @@ jobs:
                           return
                       }
 
-                      // 1. JRE Kontrolü ve Otomatik İndirme
-                      if (!ensureJreInstalled()) {
-                          logger("HATA: ARM64 JRE kurulamadığı için başlatma iptal edildi.")
+                      if (!ensureEmbeddedJreReady()) {
                           return
                       }
 
@@ -397,22 +393,19 @@ jobs:
                       val assetIndex = vObj.optString("assets", "legacy")
                       val classpath = buildClasspath(versionId, vObj)
 
-                      val javaBin = File(jreDir, "bin/java")
-                      javaBin.setExecutable(true, false)
-
-                      val jreLibDir = File(jreDir, "lib/aarch64")
-                      val jliDir = File(jreLibDir, "jli")
-                      val serverDir = File(jreLibDir, "server")
+                      val nativeDir = File(context.applicationInfo.nativeLibraryDir)
+                      val javaExec = File(nativeDir, "libjava_exec.so")
+                      val bootClasspath = "${File(jreDir, "lib/resources.jar").absolutePath}:${File(jreDir, "lib/rt.jar").absolutePath}:${File(jreDir, "lib/jsse.jar").absolutePath}:${File(jreDir, "lib/jce.jar").absolutePath}:${File(jreDir, "lib/charsets.jar").absolutePath}"
 
                       onProgress(85, "JVM (${maxRamMb}MB RAM) ateşleniyor...")
                       val cmd = mutableListOf(
-                          javaBin.absolutePath,
+                          javaExec.absolutePath,
+                          "-Xbootclasspath:$bootClasspath",
                           "-Xms512M",
                           "-Xmx${maxRamMb}M",
-                          "-Djava.library.path=${nativesDir.absolutePath}:${jreLibDir.absolutePath}",
+                          "-Djava.home=${jreDir.absolutePath}",
+                          "-Djava.library.path=${nativeDir.absolutePath}:${nativesDir.absolutePath}",
                           "-Djna.nosys=true",
-                          "-Dorg.lwjgl.util.Debug=true",
-                          "-Dorg.lwjgl.util.DebugLoader=true",
                           "-cp", classpath,
                           mainClass,
                           "--username", username,
@@ -432,7 +425,7 @@ jobs:
                       val env = pb.environment()
                       env["HOME"] = mcDir.absolutePath
                       env["JAVA_HOME"] = jreDir.absolutePath
-                      env["LD_LIBRARY_PATH"] = "${nativesDir.absolutePath}:${jreLibDir.absolutePath}:${jliDir.absolutePath}:${serverDir.absolutePath}"
+                      env["LD_LIBRARY_PATH"] = "${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64:${jreDir.absolutePath}/lib/aarch64/jli:${jreDir.absolutePath}/lib/aarch64/server"
                       env["LIBGL_ES"] = "2"
                       env["LIBGL_MIPMAP"] = "3"
 
@@ -464,30 +457,6 @@ jobs:
                   conn.inputStream.use { input ->
                       FileOutputStream(dest).use { output ->
                           input.copyTo(output)
-                      }
-                  }
-              }
-
-              private fun downloadFileWithProgress(urlStr: String, dest: File, onPercent: (Int) -> Unit) {
-                  val conn = URL(urlStr).openConnection() as HttpURLConnection
-                  conn.instanceFollowRedirects = true
-                  val totalSize = conn.contentLength.coerceAtLeast(1)
-                  var downloaded = 0L
-                  var lastReported = -1
-
-                  conn.inputStream.use { input ->
-                      FileOutputStream(dest).use { output ->
-                          val buffer = ByteArray(8192)
-                          var bytesRead: Int
-                          while (input.read(buffer).also { bytesRead = it } != -1) {
-                              output.write(buffer, 0, bytesRead)
-                              downloaded += bytesRead
-                              val pct = ((downloaded * 100) / totalSize).toInt().coerceIn(0, 100)
-                              if (pct != lastReported) {
-                                  lastReported = pct
-                                  onPercent(pct)
-                              }
-                          }
                       }
                   }
               }
@@ -614,7 +583,7 @@ jobs:
                   }
 
                   val btnLaunch = Button(this).apply {
-                      text = "2. OYUNU BAŞLAT (OTO-JRE + JVM)"
+                      text = "2. OYUNU BAŞLAT (GÖMÜLÜ JRE 8)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(
@@ -644,7 +613,7 @@ jobs:
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru v1.2 Hazır]\nOtomatik ARM64 OpenJDK 8 İndirici Aktif.\n"
+                      text = "[Axera Motoru v1.3 Hazır]\nGömülü ARM64 OpenJDK 8 Aktif (Offline Kurulum).\n"
                   }
 
                   rootLayout.addView(leftScroll)
