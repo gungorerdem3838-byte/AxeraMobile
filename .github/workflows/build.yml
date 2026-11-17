@@ -28,7 +28,7 @@ jobs:
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Download & Bundle Android Bionic ARM64 JRE
+      - name: Download & Patch ARM64 JRE for Android Bionic
         run: |
           sudo apt-get update && sudo apt-get install -y patchelf xz-utils zip
 
@@ -36,35 +36,37 @@ jobs:
           mkdir -p app/src/main/jniLibs/arm64-v8a
           mkdir -p temp_jre
 
-          echo "Android Bionic ARM64 OpenJDK 8 indiriliyor..."
-          curl -L -f "https://github.com/PojavLauncherTeam/android-openjdk-build-multiarch/releases/download/1.8.0-20210725/Internal-jre8-arm64-20210725-release.tar.xz" -o jre_bionic.tar.xz || true
+          echo "ARM64 OpenJDK 8 indiriliyor..."
+          curl -L "https://download.bell-sw.com/java/8u402+7/bellsoft-jre8u402+7-linux-aarch64.tar.gz" -o jre8.tar.gz
+          tar -xzf jre8.tar.gz -C temp_jre --strip-components=1
+          rm -f jre8.tar.gz
 
-          if [ -s jre_bionic.tar.xz ]; then
-              tar -xJf jre_bionic.tar.xz -C temp_jre
-              if [ -f temp_jre/universal.tar.xz ]; then
-                  tar -xJf temp_jre/universal.tar.xz -C temp_jre
-                  tar -xJf temp_jre/bin-arm64.tar.xz -C temp_jre
-                  rm -f temp_jre/*.tar.xz temp_jre/version
-              fi
-          fi
-
-          if [ ! -f temp_jre/bin/java ]; then
-              curl -L "https://download.bell-sw.com/java/8u402+7/bellsoft-jre8u402+7-linux-aarch64.tar.gz" -o jre8.tar.gz
-              tar -xzf jre8.tar.gz -C temp_jre --strip-components=1
-              rm -f jre8.tar.gz
-          fi
-
+          # 1. Interpreter'ı Android linker64 yap ve RPATH'i temizle
           patchelf --set-interpreter /system/bin/linker64 temp_jre/bin/java || true
+          patchelf --remove-rpath temp_jre/bin/java || true
 
+          # 2. Glibc kütüphane isimlerini doğrudan Android Bionic karşılıklarına yamala
+          for binfile in temp_jre/bin/java $(find temp_jre/lib -name "*.so"); do
+              patchelf --remove-rpath "$binfile" 2>/dev/null || true
+              patchelf --replace-needed libpthread.so.0 libc.so "$binfile" 2>/dev/null || true
+              patchelf --replace-needed librt.so.1 libc.so "$binfile" 2>/dev/null || true
+              patchelf --replace-needed libc.so.6 libc.so "$binfile" 2>/dev/null || true
+              patchelf --replace-needed libdl.so.2 libdl.so "$binfile" 2>/dev/null || true
+              patchelf --replace-needed libm.so.6 libm.so "$binfile" 2>/dev/null || true
+              patchelf --replace-needed ld-linux-aarch64.so.1 ld-android.so "$binfile" 2>/dev/null || true
+          done
+
+          # 3. Java yürütülebilir dosyasını ve .so kütüphanelerini jniLibs içine taşı
           cp temp_jre/bin/java app/src/main/jniLibs/arm64-v8a/libjava_exec.so
           chmod 755 app/src/main/jniLibs/arm64-v8a/libjava_exec.so
 
           find temp_jre/lib -name "*.so" -exec cp {} app/src/main/jniLibs/arm64-v8a/ \;
 
+          # 4. Kalan JRE runtime dosyalarını (rt.jar vb.) zip olarak assets içine göm
           cd temp_jre
           zip -r -q ../app/src/main/assets/jre_data/jre_runtime.zip lib
           cd ..
-          rm -rf temp_jre jre_bionic.tar.xz
+          rm -rf temp_jre
 
       - name: Generate Project Structure & Code
         run: |
@@ -120,8 +122,8 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 7
-                  versionName "1.6-Axera"
+                  versionCode 8
+                  versionName "1.7-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
                   }
@@ -178,7 +180,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt (Tüm glibc Köprüleri Eklendi)
+          # 6. CoreMotor.kt
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
@@ -223,30 +225,10 @@ jobs:
                   val jliDir = File(aarch64Dir, "jli").apply { mkdirs() }
                   val serverDir = File(aarch64Dir, "server").apply { mkdirs() }
 
-                  // KRİTİK: libdl.so.2, libpthread.so.0, libm.so.6, libc.so.6 eksikliklerini aşmak için runtime içinde köprüler oluştur
-                  val sysLibDir = File("/system/lib64")
-                  try {
-                      val links = mapOf(
-                          "libdl.so.2" to "libdl.so",
-                          "libpthread.so.0" to "libc.so",
-                          "libm.so.6" to "libm.so",
-                          "libc.so.6" to "libc.so"
-                      )
-                      for ((fakeName, realName) in links) {
-                          val linkFile = File(jreDir, fakeName)
-                          if (!linkFile.exists()) {
-                              val realFile = File(sysLibDir, realName)
-                              if (realFile.exists()) {
-                                  Runtime.getRuntime().exec(arrayOf("ln", "-sf", realFile.absolutePath, linkFile.absolutePath)).waitFor()
-                              }
-                          }
-                      }
-                  } catch (_: Exception) {}
-
                   if (!rtJar.exists()) {
                       try {
                           onProgress(20, "Gömülü Bionic ARM64 JRE çıkartılıyor...")
-                          logger("APK içindeki Bionic ARM64 JRE çıkartılıyor...")
+                          logger("APK içindeki yamalı ARM64 JRE çıkartılıyor...")
 
                           context.assets.open("jre_data/jre_runtime.zip").use { input ->
                               ZipInputStream(input).use { zis ->
@@ -287,7 +269,7 @@ jobs:
                       }
                   }
 
-                  onProgress(55, "Bionic JRE & glibc Köprüleri Hazır!")
+                  onProgress(55, "ELF Yamalı JRE Hazır!")
                   return rtJar.exists()
               }
 
@@ -428,7 +410,7 @@ jobs:
                           "-Xms512M",
                           "-Xmx${maxRamMb}M",
                           "-Djava.home=${jreDir.absolutePath}",
-                          "-Djava.library.path=${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}",
+                          "-Djava.library.path=${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64",
                           "-Djna.nosys=true",
                           "-cp", classpath,
                           mainClass,
@@ -449,7 +431,7 @@ jobs:
                       val env = pb.environment()
                       env["HOME"] = mcDir.absolutePath
                       env["JAVA_HOME"] = jreDir.absolutePath
-                      env["LD_LIBRARY_PATH"] = "${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64:${jreDir.absolutePath}/lib/aarch64/jli:${jreDir.absolutePath}/lib/aarch64/server"
+                      env["LD_LIBRARY_PATH"] = "${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64:${jreDir.absolutePath}/lib/aarch64/jli:${jreDir.absolutePath}/lib/aarch64/server:/system/lib64"
                       env["LIBGL_ES"] = "2"
                       env["LIBGL_MIPMAP"] = "3"
 
@@ -607,7 +589,7 @@ jobs:
                   }
 
                   val btnLaunch = Button(this).apply {
-                      text = "2. OYUNU BAŞLAT (GLIBC KÖPRÜLÜ)"
+                      text = "2. OYUNU BAŞLAT (ELF YAMALI JRE)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(
@@ -616,7 +598,7 @@ jobs:
                       ).apply { topMargin = 12 }
                   }
 
-.leftPanel.apply {
+                  leftPanel.apply {
                       addView(title)
                       addView(userEdit)
                       addView(versionSpinner)
@@ -637,7 +619,7 @@ jobs:
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru v1.6 Hazır]\nTam glibc (libdl.so.2, libm, libc) Köprüleri Aktif.\n"
+                      text = "[Axera Motoru v1.7 Hazır]\nELF Binary Yamalı (patchelf --replace-needed) JRE Aktif.\n"
                   }
 
                   rootLayout.addView(leftScroll)
