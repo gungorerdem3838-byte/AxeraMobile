@@ -37,13 +37,10 @@ jobs:
           mkdir -p temp_jre
 
           echo "Android Bionic ARM64 OpenJDK 8 indiriliyor..."
-          # PojavLauncher'ın doğrudan Android linker64 (Bionic) için derlediği JRE 8 arşivi
-          curl -L -f "https://github.com/PojavLauncherTeam/android-openjdk-build-multiarch/releases/download/1.8.0-20210725/Internal-jre8-arm64-20210725-release.tar.xz" -o jre_bionic.tar.xz || \
-          curl -L -f "https://raw.githubusercontent.com/PojavLauncherTeam/PojavLauncher/v3_openjdk/app_pojavlauncher/src/main/assets/components/jre/Internal.tar.xz" -o jre_bionic.tar.xz || true
+          curl -L -f "https://github.com/PojavLauncherTeam/android-openjdk-build-multiarch/releases/download/1.8.0-20210725/Internal-jre8-arm64-20210725-release.tar.xz" -o jre_bionic.tar.xz || true
 
           if [ -s jre_bionic.tar.xz ]; then
               tar -xJf jre_bionic.tar.xz -C temp_jre
-              # Eğer arşiv içinde universal.tar.xz ve bin-arm64.tar.xz varsa onları da aç
               if [ -f temp_jre/universal.tar.xz ]; then
                   tar -xJf temp_jre/universal.tar.xz -C temp_jre
                   tar -xJf temp_jre/bin-arm64.tar.xz -C temp_jre
@@ -51,25 +48,19 @@ jobs:
               fi
           fi
 
-          # Eğer bin/java hala yoksa yedek ARM64 JRE indir ve patchelf ile Android linker64 yaması uygula
           if [ ! -f temp_jre/bin/java ]; then
-              echo "Yedek ARM64 JRE indiriliyor ve Android linker64 yaması uygulanıyor..."
               curl -L "https://download.bell-sw.com/java/8u402+7/bellsoft-jre8u402+7-linux-aarch64.tar.gz" -o jre8.tar.gz
               tar -xzf jre8.tar.gz -C temp_jre --strip-components=1
               rm -f jre8.tar.gz
           fi
 
-          # KRİTİK ADIM: ELF interpreter'ı Android'in /system/bin/linker64 yoluna sabitle (error=2 No such file hatasını çözer)
           patchelf --set-interpreter /system/bin/linker64 temp_jre/bin/java || true
 
-          # 1. 'java' binary dosyasini jniLibs klasorune libjava_exec.so olarak koy
           cp temp_jre/bin/java app/src/main/jniLibs/arm64-v8a/libjava_exec.so
           chmod 755 app/src/main/jniLibs/arm64-v8a/libjava_exec.so
 
-          # 2. Tum native .so kutuphanelerini jniLibs icine kopyala
           find temp_jre/lib -name "*.so" -exec cp {} app/src/main/jniLibs/arm64-v8a/ \;
 
-          # 3. Geri kalan JRE dosyalarini (rt.jar, profiller, ayarlar) zip yapip assets icine koy
           cd temp_jre
           zip -r -q ../app/src/main/assets/jre_data/jre_runtime.zip lib
           cd ..
@@ -129,8 +120,8 @@ jobs:
                   applicationId "com.axera.launcher"
                   minSdk 24
                   targetSdk 34
-                  versionCode 5
-                  versionName "1.4-Axera"
+                  versionCode 6
+                  versionName "1.5-Axera"
                   ndk {
                       abiFilters 'arm64-v8a'
                   }
@@ -144,12 +135,8 @@ jobs:
               }
 
               buildTypes {
-                  release {
-                      minifyEnabled false
-                  }
-                  debug {
-                      minifyEnabled false
-                  }
+                  release { minifyEnabled false }
+                  debug { minifyEnabled false }
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -160,8 +147,7 @@ jobs:
               }
           }
 
-          dependencies {
-          }
+          dependencies {}
           EOF
 
           # 5. AndroidManifest.xml
@@ -192,7 +178,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. CoreMotor.kt
+          # 6. CoreMotor.kt (Pthread / C Kütüphane Köprüsü Eklendi)
           cat << 'EOF' > app/src/main/java/com/axera/launcher/CoreMotor.kt
           package com.axera.launcher
 
@@ -237,6 +223,16 @@ jobs:
                   val jliDir = File(aarch64Dir, "jli").apply { mkdirs() }
                   val serverDir = File(aarch64Dir, "server").apply { mkdirs() }
 
+                  // KRİTİK: libpthread.so.0 eksikliğini aşmak için runtime klasöründe sahte/köprü .so dosyaları oluştur
+                  val sysLibDir = File("/system/lib64")
+                  try {
+                      val pthreadLink = File(jreDir, "libpthread.so.0")
+                      if (!pthreadLink.exists()) {
+                          // Android içinde pthread fonksiyonları libc içindedir, libc.so'yu pthread olarak da bağla
+                          Runtime.getRuntime().exec(arrayOf("ln", "-sf", File(sysLibDir, "libc.so").absolutePath, pthreadLink.absolutePath)).waitFor()
+                      }
+                  } catch (_: Exception) {}
+
                   if (!rtJar.exists()) {
                       try {
                           onProgress(20, "Gömülü Bionic ARM64 JRE çıkartılıyor...")
@@ -267,7 +263,6 @@ jobs:
                       }
                   }
 
-                  // Her başlatmada native .so sembolik linklerini doğrula (APK güncellendiğinde değişen yol için)
                   nativeDir.listFiles()?.forEach { soFile ->
                       if (soFile.name.endsWith(".so") && soFile.name != "libjava_exec.so") {
                           try {
@@ -282,7 +277,7 @@ jobs:
                       }
                   }
 
-                  onProgress(55, "Bionic JRE Hazır!")
+                  onProgress(55, "Bionic JRE & Pthread Köprüsü Hazır!")
                   return rtJar.exists()
               }
 
@@ -423,7 +418,7 @@ jobs:
                           "-Xms512M",
                           "-Xmx${maxRamMb}M",
                           "-Djava.home=${jreDir.absolutePath}",
-                          "-Djava.library.path=${nativeDir.absolutePath}:${nativesDir.absolutePath}",
+                          "-Djava.library.path=${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}",
                           "-Djna.nosys=true",
                           "-cp", classpath,
                           mainClass,
@@ -444,7 +439,8 @@ jobs:
                       val env = pb.environment()
                       env["HOME"] = mcDir.absolutePath
                       env["JAVA_HOME"] = jreDir.absolutePath
-                      env["LD_LIBRARY_PATH"] = "${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64:${jreDir.absolutePath}/lib/aarch64/jli:${jreDir.absolutePath}/lib/aarch64/server"
+                      // LD_LIBRARY_PATH içine jreDir de eklendi ki libpthread.so.0 köprüsü okunsun
+                      env["LD_LIBRARY_PATH"] = "${nativeDir.absolutePath}:${nativesDir.absolutePath}:${jreDir.absolutePath}:${jreDir.absolutePath}/lib/aarch64:${jreDir.absolutePath}/lib/aarch64/jli:${jreDir.absolutePath}/lib/aarch64/server"
                       env["LIBGL_ES"] = "2"
                       env["LIBGL_MIPMAP"] = "3"
 
@@ -602,7 +598,7 @@ jobs:
                   }
 
                   val btnLaunch = Button(this).apply {
-                      text = "2. OYUNU BAŞLAT (BIONIC JRE 8)"
+                      text = "2. OYUNU BAŞLAT (PTHREAD KÖPRÜLÜ)"
                       setBackgroundColor(Color.parseColor("#00C853"))
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(
@@ -632,7 +628,7 @@ jobs:
                       setPadding(16, 16, 16, 16)
                       gravity = Gravity.BOTTOM
                       movementMethod = ScrollingMovementMethod()
-                      text = "[Axera Motoru v1.4 Hazır]\nAndroid Bionic Linker64 + Gömülü ARM64 JRE 8 Aktif.\n"
+                      text = "[Axera Motoru v1.5 Hazır]\nlibpthread.so.0 Bionic Köprüsü Aktif.\n"
                   }
 
                   rootLayout.addView(leftScroll)
