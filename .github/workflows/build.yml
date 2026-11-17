@@ -19,8 +19,14 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Generate Project Structure & Code
         run: |
@@ -109,8 +115,7 @@ jobs:
           # 5. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-              package="com.axera.launcher">
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -398,7 +403,6 @@ jobs:
                   }
 
                   val versionSpinner = Spinner(this).apply {
-                      // İlk test ve düşük RAM optimizasyonu için hafif sürümler + modern sürümler
                       val versions = arrayOf("1.8.9", "1.12.2", "1.16.5", "1.20.4", "1.21.11")
                       adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, versions)
                   }
